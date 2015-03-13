@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-_
 #!/usr/bin/python
 
 #----------------------------------------------------------------------
@@ -232,8 +233,9 @@ def add_common_options(parser):
     parser.add_option('-S', '--stack-history', action='store_true', dest='stack_history', help='gets the stack history for all allocations whose start address matches each malloc block if MallocStackLogging is enabled', default=False)
     parser.add_option('-F', '--max-frames', type='int', dest='max_frames', help='the maximum number of stack frames to print when using the --stack or --stack-history options (default=128)', default=128)
     parser.add_option('-H', '--max-history', type='int', dest='max_history', help='the maximum number of stack history backtraces to print for each allocation when using the --stack-history option (default=16)', default=16)
-    parser.add_option('-M', '--max-matches', type='int', dest='max_matches', help='the maximum number of matches to print', default=32)
+    parser.add_option('-M', '--max-matches', type='int', dest='max_matches', help='the maximum number of matches to print', default=320)
     parser.add_option('-O', '--offset', type='int', dest='offset', help='the matching data must be at this offset', default=-1)
+    parser.add_option('-Z', '--zero', action='store_true', dest='zero', help='match ending zero for cstr', default=False)
     parser.add_option('--ignore-stack', action='store_false', dest='search_stack', help="Don't search the stack when enumerating memory", default=True)
     parser.add_option('--ignore-heap', action='store_false', dest='search_heap', help="Don't search the heap allocations when enumerating memory", default=True)
     parser.add_option('--ignore-segments', action='store_false', dest='search_segments', help="Don't search readable executable segments enumerating memory", default=True)
@@ -557,6 +559,18 @@ def display_match_results (result, options, arg_str_description, expr, print_no_
                         desc = dynamic_value.GetObjectDescription()
                         if desc:
                             result_output += '\n%s' % (desc)
+
+                if options.type == 'cstr':
+                    expr = '''
+                        char *begin = (char *)%s;
+                        while(*begin != 0)
+                            begin = begin - 1;
+                        begin + 1;
+                    '''
+                    dv = frame.EvaluateExpression (expr % match_addr, expr_options).GetDynamicValue(lldb.eDynamicCanRunTarget)
+                    if dv.unsigned != match_addr:
+                        result_output += '\n(%#16.16x: %s)' % (dv.unsigned, dv.GetSummary())
+
                 if result_output:
                     result.AppendMessage(result_output)
                 if options.memory:
@@ -669,6 +683,98 @@ baton.matches'''
     else:
         result.AppendMessage('error: no pointer arguments were given')
 
+def get_int_refs_options ():
+    usage = "usage: %prog [options] <EXPR> [EXPR ...]"
+    description='''Searches all allocations on the heap for int values on 
+darwin user space programs. Any matches that were found will dump the malloc 
+blocks that contain the pointers and might be able to print what kind of 
+objects the pointers are contained in using dynamic type information in the
+program.'''
+    parser = optparse.OptionParser(description=description, prog='int_refs',usage=usage)
+    add_common_options(parser)
+    return parser
+    
+
+def int_refs(debugger, command, result, dict):
+    command_args = shlex.split(command)
+    parser = get_int_refs_options()
+    try:
+        (options, args) = parser.parse_args(command_args)
+    except:
+        return
+
+    process = lldb.debugger.GetSelectedTarget().GetProcess()
+    if not process:
+        result.AppendMessage('error: invalid process')
+        return
+    frame = process.GetSelectedThread().GetSelectedFrame()
+    if not frame:
+        result.AppendMessage('error: invalid frame')
+        return
+
+    options.type = 'integer'
+    if options.format == None: 
+        options.format = "i" # 'A' is "address" format
+
+    if args:
+        # When we initialize the expression, we must define any types that
+        # we will need when looking at every allocation. We must also define
+        # a type named callback_baton_t and make an instance named "baton" 
+        # and initialize it how ever we want to. The address of "baton" will
+        # be passed into our range callback. callback_baton_t must contain
+        # a member named "callback" whose type is "range_callback_t". This
+        # will be used by our zone callbacks to call the range callback for
+        # each malloc range.
+        user_init_code_format = '''
+#define MAX_MATCHES %u
+struct $malloc_match {
+    void *addr;
+    uintptr_t size;
+    uintptr_t offset;
+    uintptr_t type;
+};
+typedef struct callback_baton_t {
+    range_callback_t callback;
+    unsigned num_matches;
+    $malloc_match matches[MAX_MATCHES];
+    unsigned i;
+} callback_baton_t;
+range_callback_t range_callback = [](task_t task, void *baton, unsigned type, uintptr_t ptr_addr, uintptr_t ptr_size) -> void {
+    callback_baton_t *info = (callback_baton_t *)baton;
+    const unsigned size = sizeof(unsigned);
+    const char *begin = (const char *)ptr_addr;
+    const char *end = begin + ptr_size - size;
+    for (const char *s = begin; s <= end; ++s) {
+        if (info->i == *(unsigned *)s) {
+            if (info->num_matches < MAX_MATCHES) {
+                info->matches[info->num_matches].addr = (void*)ptr_addr;
+                info->matches[info->num_matches].size = ptr_size;
+                info->matches[info->num_matches].offset = s - begin;
+                info->matches[info->num_matches].type = type;
+                ++info->num_matches;
+            }
+        }
+    }
+};
+callback_baton_t baton = { range_callback, 0, {0}, %s };
+'''
+        # We must also define a snippet of code to be run that returns
+        # the result of the expression we run.
+        # Here we return NULL if our pointer was not found in any malloc blocks,
+        # and we return the address of the matches array so we can then access
+        # the matching results
+        user_return_code = '''if (baton.num_matches < MAX_MATCHES)
+    baton.matches[baton.num_matches].addr = 0; // Terminate the matches array
+baton.matches'''
+        # Iterate through all of our pointer expressions and display the results
+        for ptr_expr in args:
+            user_init_code = user_init_code_format % (options.max_matches, ptr_expr)
+            expr = get_iterate_memory_expr(options, process, user_init_code, user_return_code)          
+            arg_str_description = 'malloc block containing pointer %s' % ptr_expr
+            display_match_results (result, options, arg_str_description, expr)
+    else:
+        result.AppendMessage('error: no pointer arguments were given')
+
 def get_cstr_refs_options():
     usage = "usage: %prog [options] <CSTR> [CSTR ...]"
     description='''Searches all allocations on the heap for C string values on
@@ -732,7 +838,7 @@ range_callback_t range_callback = [](task_t task, void *baton, unsigned type, ui
         const char *begin = (const char *)ptr_addr;
         const char *end = begin + ptr_size - info->cstr_len;
         for (const char *s = begin; s < end; ++s) {
-            if ((int)memcmp(s, info->cstr, info->cstr_len) == 0) {
+            if ((int)memcmp(s, info->cstr, info->cstr_len+%s) == 0) {
                 if (info->num_matches < MAX_MATCHES) {
                     info->matches[info->num_matches].addr = (void*)ptr_addr;
                     info->matches[info->num_matches].size = ptr_size;
@@ -756,7 +862,7 @@ callback_baton_t baton = { range_callback, 0, {0}, cstr, (unsigned)strlen(cstr) 
 baton.matches'''
         # Iterate through all of our pointer expressions and display the results
         for cstr in args:
-            user_init_code = user_init_code_format % (options.max_matches, cstr)
+            user_init_code = user_init_code_format % (options.max_matches, 1 if options.zero else 0, cstr)
             expr = get_iterate_memory_expr(options, process, user_init_code, user_return_code)          
             arg_str_description = 'malloc block containing "%s"' % cstr            
             display_match_results (result, options, arg_str_description, expr)
@@ -1121,9 +1227,11 @@ ptr_refs.__doc__ = get_ptr_refs_options().format_help()
 cstr_refs.__doc__ = get_cstr_refs_options().format_help()
 malloc_info.__doc__ = get_malloc_info_options().format_help()
 objc_refs.__doc__ = get_objc_refs_options().format_help()
+int_refs.__doc__ = get_int_refs_options().format_help()
 lldb.debugger.HandleCommand('command script add -f %s.ptr_refs ptr_refs' % __name__)
 lldb.debugger.HandleCommand('command script add -f %s.cstr_refs cstr_refs' % __name__)
 lldb.debugger.HandleCommand('command script add -f %s.malloc_info malloc_info' % __name__)
+lldb.debugger.HandleCommand('command script add -f %s.int_refs int_refs' % __name__)
 # lldb.debugger.HandleCommand('command script add -f %s.heap heap' % package_name)
 # lldb.debugger.HandleCommand('command script add -f %s.section_ptr_refs section_ptr_refs' % package_name)
 # lldb.debugger.HandleCommand('command script add -f %s.stack_ptr_refs stack_ptr_refs' % package_name)
