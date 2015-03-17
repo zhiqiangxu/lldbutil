@@ -568,8 +568,7 @@ def display_match_results (result, options, arg_str_description, expr, print_no_
                         begin + 1;
                     '''
                     dv = frame.EvaluateExpression (expr % match_addr, expr_options).GetDynamicValue(lldb.eDynamicCanRunTarget)
-                    if dv.unsigned != match_addr:
-                        result_output += '\n(%#16.16x: %s)' % (dv.unsigned, dv.GetSummary())
+                    result_output += ' (%#16.16x: %s)' % (dv.unsigned, dv.GetSummary())
 
                 if result_output:
                     result.AppendMessage(result_output)
