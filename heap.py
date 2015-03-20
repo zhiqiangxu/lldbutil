@@ -19,6 +19,8 @@ import shlex
 import string
 import tempfile
 import lldb.utils.symbolication
+import time
+import ctypes
 
 g_libheap_dylib_dir = None
 g_libheap_dylib_dict = dict()
@@ -435,6 +437,192 @@ info''' % (options.max_frames, options.max_history, addr);
         result.AppendMessage('error: expression failed "%s" => %s' % (expr, expr_sbvalue.error))
 
 
+def evaluate(expr):
+    frame = lldb.debugger.GetSelectedTarget().GetProcess().GetSelectedThread().GetSelectedFrame()
+    if not frame:
+        result.AppendMessage('error: invalid frame')
+        return 0
+    expr_options = lldb.SBExpressionOptions()
+    expr_options.SetIgnoreBreakpoints(True);
+    expr_options.SetFetchDynamicValue(lldb.eNoDynamicValues);
+    expr_options.SetTimeoutInMicroSeconds (30*1000*1000) # 30 second timeout
+    expr_options.SetTryAllThreads (False)
+    expr_sbvalue = frame.EvaluateExpression (expr, expr_options)
+    if expr_sbvalue.error.Success():
+        return expr_sbvalue
+    else:
+        print str(expr_sbvalue.error)
+
+class Group(ctypes.Structure):
+    _fields_ = [("addr", ctypes.c_uint),
+                ("size", ctypes.c_uint),
+                ("type", ctypes.c_uint)]
+
+class Vtable(ctypes.Structure):
+    _fields_ = [("addr", ctypes.c_uint)]
+
+def display_match_results2 (result, options, num, struct_size, expr, args):
+    all_types = set()
+    type_hash = {}
+    symbol_hash = {}
+    expr_sbvalue = evaluate(expr)
+    print args
+    if expr_sbvalue:
+        data = expr_sbvalue.GetPointeeData(0, num)
+        error = lldb.SBError()
+        sb_value = lldb.SBValue()
+        expr_options = lldb.SBExpressionOptions()
+        expr_options.SetIgnoreBreakpoints(True);
+        expr_options.SetFetchDynamicValue(lldb.eDynamicCanRunTarget);
+        expr_options.SetTimeoutInMicroSeconds (30*1000*1000) # 30 second timeout
+        expr_options.SetTryAllThreads (False)
+        GroupArray = Group * (num + 1)
+        bytes = data.ReadRawData(error, 0, num*struct_size)
+        match_value = GroupArray()
+        ctypes.memmove(ctypes.addressof(match_value), bytes, len(bytes))
+
+        frame = lldb.debugger.GetSelectedTarget().GetProcess().GetSelectedThread().GetSelectedFrame()
+        target = lldb.debugger.GetSelectedTarget()
+        process = lldb.debugger.GetSelectedTarget().GetProcess()
+
+        i = 0
+        count = 0
+        no_symbol_count = 0
+        STEP = 10000
+        while 1:
+            match_entry = match_value[count];count = count + 1
+            if count % STEP == 0:
+                print '{}/{}'.format(count, num)
+            if i > options.max_matches:
+                result.AppendMessage('warning: the max number of matches (%u) was reached, use the --max-matches option to get more results' % (options.max_matches))
+                break
+            sb_addr = match_entry.addr
+            malloc_addr = sb_addr
+            if malloc_addr == 0:
+                break
+
+            malloc_size = match_entry.size
+            offset = 0
+            match_addr = malloc_addr;
+            type_flags = match_entry.type
+
+            if type_flags == 64:
+                search_stack_old = options.search_stack
+                search_segments_old = options.search_segments
+                search_heap_old = options.search_heap
+                search_vm_regions = options.search_vm_regions
+                options.search_stack = True
+                options.search_segments = True
+                options.search_heap = True
+                options.search_vm_regions = False
+                if malloc_info_impl (lldb.debugger, result, options, [hex(malloc_addr + offset)]):
+                    print_entry = False
+                options.search_stack = search_stack_old
+                options.search_segments = search_segments_old
+                options.search_heap = search_heap_old
+                options.search_vm_regions = search_vm_regions
+
+            memory = process.ReadMemory(malloc_addr, 4, error)
+            memory_value = Vtable()
+            ctypes.memmove(ctypes.addressof(memory_value), memory, 4)
+            if memory_value.addr in symbol_hash:
+                symbol = symbol_hash[memory_value.addr]
+            else:
+                so_addr = target.ResolveLoadAddress (memory_value.addr)
+                sym_ctx = target.ResolveSymbolContextForAddress (so_addr, lldb.eSymbolContextSymbol)
+                symbol = sym_ctx.GetSymbol()
+                symbol_hash[memory_value.addr] = symbol
+            if not symbol.GetName():
+                no_symbol_count += 1
+                if no_symbol_count % STEP == 0:
+                    print 'no_symbol_count:{}'.format(no_symbol_count)
+                continue
+            symbol_name = symbol.GetName()[len('vtable for '):]
+            if symbol_name in type_hash:
+                derefed_dynamic_type = type_hash[symbol_name]
+            else:
+                derefed_dynamic_type = target.FindFirstType(symbol_name)
+                type_hash[symbol_name] = derefed_dynamic_type
+            if not derefed_dynamic_type:
+                continue
+
+            '''
+            #slow:      
+            dynamic_value = expr_sbvalue.GetChildAtIndex(count).GetChildMemberWithName('addr', lldb.eDynamicCanRunTarget)#.GetDynamicValue(lldb.eDynamicCanRunTarget)
+            #不快:      dynamic_value = expr_sbvalue.GetValueForExpressionPath('[{}].addr'.format(count)).GetDynamicValue(lldb.eDynamicCanRunTarget)
+            #不对:      dynamic_value = sb_value.CreateValueFromExpression(None, '(void*){}'.format(match_addr), expr_options).GetDynamicValue(lldb.eDynamicCanRunTarget)
+            #慢:        dynamic_value = frame.EvaluateExpression('(void*){}'.format(match_addr), lldb.eDynamicCanRunTarget)
+            if not dynamic_value.error.Success():
+                print dynamic_value.GetError()
+                return
+            if dynamic_value.type.name == 'void *' or not dynamic_value.type.name:
+                pass
+            else:
+'''
+            if True:
+                description = '%#16.16x: %s' % (match_addr, type_flags_to_description(type_flags, malloc_addr, malloc_size, offset))
+                if options.show_size:
+                    description += ' <%5u>' % (malloc_size)
+                if options.show_range:
+                    description += ' [%#x - %#x)' % (malloc_addr, malloc_addr + malloc_size)
+
+                if True:                        
+                    derefed_dynamic_type_size = derefed_dynamic_type.size
+                    derefed_dynamic_type_name = derefed_dynamic_type.name
+                    all_types.add(derefed_dynamic_type_name)
+                    description += ' '
+                    is_match = True if derefed_dynamic_type_name.split('::')[-1] in args else False
+                    if offset < derefed_dynamic_type_size:
+                        member_list = list();
+                        get_member_types_for_offset (derefed_dynamic_type, offset, member_list)
+                        if member_list:
+                            member_path = ''
+                            for member in member_list:
+                                member_name = member.name
+                                if member_name: 
+                                    if member_name.split('::')[-1] in args:
+                                        is_match = True
+                                    if member_path:
+                                        member_path += '.'
+                                    member_path += member_name
+                            if member_path:
+                                derefed_dynamic_type_name += '.%s' % (member_path)
+                    description += derefed_dynamic_type_name
+                    if not is_match:
+                        continue
+                    i += 1
+
+
+                result_output = ''
+                if description:
+                    result_output += description
+                    if options.print_type and derefed_dynamic_value:
+                        result_output += ' %s' % (derefed_dynamic_value)
+                    if options.print_object_description and dynamic_value:
+                        desc = dynamic_value.GetObjectDescription()
+                        if desc:
+                            result_output += '\n%s' % (desc)
+
+                if result_output:
+                    result.AppendMessage(result_output)
+                if options.memory:
+                    cmd_result = lldb.SBCommandReturnObject()
+                    if options.format == None:
+                        memory_command = "memory read --force 0x%x 0x%x" % (malloc_addr, malloc_addr + malloc_size)
+                    else:
+                        memory_command = "memory read --force -f %s 0x%x 0x%x" % (options.format, malloc_addr, malloc_addr + malloc_size)
+                    if options.verbose:
+                        result.AppendMessage(memory_command)
+                    lldb.debugger.GetCommandInterpreter().HandleCommand(memory_command, cmd_result)
+                    result.AppendMessage(cmd_result.GetOutput())
+                if options.stack_history:
+                    dump_stack_history_entries(options, result, malloc_addr, 1)
+                elif options.stack:
+                    dump_stack_history_entries(options, result, malloc_addr, 0)
+
+        result.AppendMessage('{} mallocs, {} types, {} no symbol in total'.format(count, len(all_types), no_symbol_count))
+#result.AppendMessage('types:{}'.format(type_hash.keys()))
+
 def display_match_results (result, options, arg_str_description, expr, print_no_matches = True):
     frame = lldb.debugger.GetSelectedTarget().GetProcess().GetSelectedThread().GetSelectedFrame()
     if not frame:
@@ -679,6 +867,109 @@ baton.matches'''
             expr = get_iterate_memory_expr(options, process, user_init_code, user_return_code)          
             arg_str_description = 'malloc block containing pointer %s' % ptr_expr
             display_match_results (result, options, arg_str_description, expr)
+    else:
+        result.AppendMessage('error: no pointer arguments were given')
+
+def get_class_refs_options ():
+    usage = "usage: %prog [options] <EXPR> [EXPR ...]"
+    description='''Searches all allocations on the heap for class instances on 
+darwin user space programs. Any matches that were found will dump the malloc 
+blocks that contain the pointers and might be able to print what kind of 
+objects the pointers are contained in using dynamic type information in the
+program.'''
+    parser = optparse.OptionParser(description=description, prog='class_refs',usage=usage)
+    add_common_options(parser)
+    return parser
+    
+
+def class_refs(debugger, command, result, dict):
+    start_time = time.time()
+    command_args = shlex.split(command)
+    parser = get_int_refs_options()
+    try:
+        (options, args) = parser.parse_args(command_args)
+    except:
+        return
+
+    process = lldb.debugger.GetSelectedTarget().GetProcess()
+    if not process:
+        result.AppendMessage('error: invalid process')
+        return
+    frame = process.GetSelectedThread().GetSelectedFrame()
+    if not frame:
+        result.AppendMessage('error: invalid frame')
+        return
+
+    options.type = 'malloc_info'
+
+    if args:
+        # When we initialize the expression, we must define any types that
+        # we will need when looking at every allocation. We must also define
+        # a type named callback_baton_t and make an instance named "baton" 
+        # and initialize it how ever we want to. The address of "baton" will
+        # be passed into our range callback. callback_baton_t must contain
+        # a member named "callback" whose type is "range_callback_t". This
+        # will be used by our zone callbacks to call the range callback for
+        # each malloc range.
+        user_init_code_format = '''
+#define MAX_MATCHES %u
+struct $malloc_match {
+    void *addr;
+    uintptr_t size;
+    uintptr_t type;
+};
+typedef struct callback_baton_t {
+    range_callback_t callback;
+    unsigned num_matches;
+    $malloc_match matches[MAX_MATCHES];
+} callback_baton_t;
+range_callback_t range_callback = [](task_t task, void *baton, unsigned type, uintptr_t ptr_addr, uintptr_t ptr_size) -> void {
+    callback_baton_t *info = (callback_baton_t *)baton;
+    info->matches[info->num_matches].addr = (void*)ptr_addr;
+    info->matches[info->num_matches].type = type;
+    info->matches[info->num_matches].size = ptr_size;
+    ++info->num_matches;
+};
+callback_baton_t baton = { range_callback, 0, {0} };
+'''
+        # We must also define a snippet of code to be run that returns
+        # the result of the expression we run.
+        # Here we return NULL if our pointer was not found in any malloc blocks,
+        # and we return the address of the matches array so we can then access
+        # the matching results
+        user_return_code = '''
+        baton.matches[baton.num_matches].addr = 0;
+baton.matches'''
+
+        user_init_code0 = '''
+typedef struct callback_baton_t {
+    range_callback_t callback;
+    unsigned num_matches;
+} callback_baton_t;
+range_callback_t range_callback = [](task_t task, void *baton, unsigned type, uintptr_t ptr_addr, uintptr_t ptr_size) -> void {
+    callback_baton_t *info = (callback_baton_t *)baton;
+    ++info->num_matches;
+};
+callback_baton_t baton = { range_callback, 0 };
+'''
+        user_return_code0 = '''
+        baton.num_matches;
+'''
+        # Iterate through all of our pointer expressions and display the results
+        expr = get_iterate_memory_expr(options, process, user_init_code0, user_return_code0)
+        expr_value = evaluate(expr)
+        user_init_code = user_init_code_format % (expr_value.unsigned + 1)
+        struct_size = evaluate('''
+struct $malloc_match {
+    void *addr;
+    uintptr_t size;
+    uintptr_t type;
+};
+sizeof(struct $malloc_match)
+''').unsigned
+        expr = get_iterate_memory_expr(options, process, user_init_code, user_return_code)
+        display_match_results2(result, options, expr_value.unsigned, struct_size, expr, args)
+        result.AppendMessage('{} seconds'.format(time.time() - start_time))
     else:
         result.AppendMessage('error: no pointer arguments were given')
 
@@ -1227,10 +1518,12 @@ cstr_refs.__doc__ = get_cstr_refs_options().format_help()
 malloc_info.__doc__ = get_malloc_info_options().format_help()
 objc_refs.__doc__ = get_objc_refs_options().format_help()
 int_refs.__doc__ = get_int_refs_options().format_help()
+class_refs.__doc__ = get_class_refs_options().format_help()
 lldb.debugger.HandleCommand('command script add -f %s.ptr_refs ptr_refs' % __name__)
 lldb.debugger.HandleCommand('command script add -f %s.cstr_refs cstr_refs' % __name__)
 lldb.debugger.HandleCommand('command script add -f %s.malloc_info malloc_info' % __name__)
 lldb.debugger.HandleCommand('command script add -f %s.int_refs int_refs' % __name__)
+lldb.debugger.HandleCommand('command script add -f %s.class_refs class_refs' % __name__)
 # lldb.debugger.HandleCommand('command script add -f %s.heap heap' % package_name)
 # lldb.debugger.HandleCommand('command script add -f %s.section_ptr_refs section_ptr_refs' % package_name)
 # lldb.debugger.HandleCommand('command script add -f %s.stack_ptr_refs stack_ptr_refs' % package_name)

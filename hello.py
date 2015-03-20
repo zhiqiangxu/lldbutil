@@ -76,8 +76,27 @@ def find_cstr(debugger, command, result, d):
 
 def ptype(debugger, command, result, d):
     frame = lldb.debugger.GetSelectedTarget().GetProcess().GetSelectedThread().GetSelectedFrame()
-    dv = frame.EvaluateExpression('(void*)%s' % command).GetDynamicValue(lldb.eDynamicCanRunTarget)
+    dv = frame.EvaluateExpression('(void*)%s' % command, lldb.eDynamicCanRunTarget)#.GetDynamicValue(lldb.eDynamicCanRunTarget)
     print dv.type.name
+
+    target = lldb.debugger.GetSelectedTarget()
+    so_addr = target.ResolveLoadAddress (int(command, 16))
+    print so_addr.IsValid()
+    sym_ctx = target.ResolveSymbolContextForAddress (so_addr, lldb.eSymbolContextSymbol)
+    print sym_ctx
+    symbol = sym_ctx.GetSymbol()
+    print symbol
+    print symbol.GetName()
+    print symbol.GetType()
+
+    print '-----'
+    symbolicator = lldb.utils.symbolication.Symbolicator()
+    symbolicator.target = lldb.debugger.GetSelectedTarget()
+    frames = symbolicator.symbolicate(int(command, 16))
+    print frames
+
+    print '----'
+    print target.FindFirstType('SpriteButton')
 
 
 def evaluateExpressionValue(expression, printErrors=True):
