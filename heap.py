@@ -456,10 +456,8 @@ def evaluate(expr):
 class Group(ctypes.Structure):
     _fields_ = [("addr", ctypes.c_uint),
                 ("size", ctypes.c_uint),
-                ("type", ctypes.c_uint)]
-
-class Vtable(ctypes.Structure):
-    _fields_ = [("addr", ctypes.c_uint)]
+                ("type", ctypes.c_uint),
+                ("vptr", ctypes.c_uint)]
 
 def display_match_results2 (result, options, num, struct_size, expr, args):
     all_types = set()
@@ -522,16 +520,14 @@ def display_match_results2 (result, options, num, struct_size, expr, args):
                 options.search_heap = search_heap_old
                 options.search_vm_regions = search_vm_regions
 
-            memory = process.ReadMemory(malloc_addr, 4, error)
-            memory_value = Vtable()
-            ctypes.memmove(ctypes.addressof(memory_value), memory, 4)
-            if memory_value.addr in symbol_hash:
-                symbol = symbol_hash[memory_value.addr]
+            vptr = match_entry.vptr
+            if vptr in symbol_hash:
+                symbol = symbol_hash[vptr]
             else:
-                so_addr = target.ResolveLoadAddress (memory_value.addr)
+                so_addr = target.ResolveLoadAddress (vptr)
                 sym_ctx = target.ResolveSymbolContextForAddress (so_addr, lldb.eSymbolContextSymbol)
                 symbol = sym_ctx.GetSymbol()
-                symbol_hash[memory_value.addr] = symbol
+                symbol_hash[vptr] = symbol
             if not symbol.GetName():
                 no_symbol_count += 1
                 if no_symbol_count % STEP == 0:
@@ -620,7 +616,7 @@ def display_match_results2 (result, options, num, struct_size, expr, args):
                 elif options.stack:
                     dump_stack_history_entries(options, result, malloc_addr, 0)
 
-        result.AppendMessage('{} mallocs, {} types, {} no symbol in total'.format(count, len(all_types), no_symbol_count))
+        result.AppendMessage('{} mallocs, {} types, {} no symbol in total'.format(count-1, len(all_types), no_symbol_count))
 #result.AppendMessage('types:{}'.format(type_hash.keys()))
 
 def display_match_results (result, options, arg_str_description, expr, print_no_matches = True):
@@ -917,6 +913,7 @@ struct $malloc_match {
     void *addr;
     uintptr_t size;
     uintptr_t type;
+    void *vptr;
 };
 typedef struct callback_baton_t {
     range_callback_t callback;
@@ -928,6 +925,7 @@ range_callback_t range_callback = [](task_t task, void *baton, unsigned type, ui
     info->matches[info->num_matches].addr = (void*)ptr_addr;
     info->matches[info->num_matches].type = type;
     info->matches[info->num_matches].size = ptr_size;
+    info->matches[info->num_matches].vptr = (void*)(*(uintptr_t*)ptr_addr);
     ++info->num_matches;
 };
 callback_baton_t baton = { range_callback, 0, {0} };
@@ -964,6 +962,7 @@ struct $malloc_match {
     void *addr;
     uintptr_t size;
     uintptr_t type;
+    void *vptr;
 };
 sizeof(struct $malloc_match)
 ''').unsigned
