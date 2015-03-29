@@ -629,12 +629,15 @@ def display_match_results (result, options, arg_str_description, expr, print_no_
     expr_options.SetFetchDynamicValue(lldb.eNoDynamicValues);
     expr_options.SetTimeoutInMicroSeconds (30*1000*1000) # 30 second timeout
     expr_options.SetTryAllThreads (False)
-    expr_sbvalue = frame.EvaluateExpression (expr, expr_options)
     if options.verbose:
         print "expression:"
         print expr
         print "expression result:"
+        expr_sbvalue = frame.EvaluateExpression (expr, expr_options)
         print expr_sbvalue
+    else:
+        expr_sbvalue = frame.EvaluateExpression (expr, expr_options)
+
     if expr_sbvalue.error.Success():
         match_value = lldb.value(expr_sbvalue)  
         i = 0
@@ -865,6 +868,187 @@ baton.matches'''
             display_match_results (result, options, arg_str_description, expr)
     else:
         result.AppendMessage('error: no pointer arguments were given')
+
+def get_memory_leak_options ():
+    usage = "usage: %prog [options] <EXPR> [EXPR ...]"
+    description='''Searches all allocations on the heap for memory leak on
+darwin user space programs.'''
+    parser = optparse.OptionParser(description=description, prog='memory_leak',usage=usage)
+    add_common_options(parser)
+    return parser
+    
+
+def memory_leak(debugger, command, result, dict):
+    start_time = time.time()
+    command_args = shlex.split(command)
+    parser = get_int_refs_options()
+    try:
+        (options, args) = parser.parse_args(command_args)
+    except:
+        return
+
+    process = lldb.debugger.GetSelectedTarget().GetProcess()
+    if not process:
+        result.AppendMessage('error: invalid process')
+        return
+    frame = process.GetSelectedThread().GetSelectedFrame()
+    if not frame:
+        result.AppendMessage('error: invalid frame')
+        return
+
+    options.type = 'malloc_info'
+
+    if True:
+        user_init_code_format = '''
+#define MAX_MATCHES %u
+struct $malloc_match {
+    void *addr;
+    uintptr_t size;
+    uintptr_t offset;
+    uintptr_t type;
+};
+typedef struct callback_baton_t {
+    range_callback_t callback;
+    unsigned num_matches;
+    $malloc_match matches[MAX_MATCHES];
+} callback_baton_t;
+range_callback_t range_callback = [](task_t task, void *baton, unsigned type, uintptr_t ptr_addr, uintptr_t ptr_size) -> void {
+    callback_baton_t *info = (callback_baton_t *)baton;
+    info->matches[info->num_matches].addr = (void*)ptr_addr;
+    info->matches[info->num_matches].type = type;
+    info->matches[info->num_matches].size = ptr_size;
+    info->matches[info->num_matches].offset = 0;
+    ++info->num_matches;
+};
+callback_baton_t baton = { range_callback, 0, {0} };
+'''
+        user_return_code = '''
+        baton.matches[baton.num_matches].addr = 0;
+baton.matches'''
+
+        user_init_code0 = '''
+typedef struct callback_baton_t {
+    range_callback_t callback;
+    unsigned num_matches;
+} callback_baton_t;
+range_callback_t range_callback = [](task_t task, void *baton, unsigned type, uintptr_t ptr_addr, uintptr_t ptr_size) -> void {
+    callback_baton_t *info = (callback_baton_t *)baton;
+    ++info->num_matches;
+};
+callback_baton_t baton = { range_callback, 0 };
+'''
+        user_return_code0 = '''
+        baton.num_matches;
+'''
+        # Iterate through all of our pointer expressions and display the results
+        expr = get_iterate_memory_expr(options, process, user_init_code0, user_return_code0)
+        expr_value = evaluate(expr)
+        num_match = expr_value.unsigned
+        user_init_code = user_init_code_format % (num_match + 1)
+        struct_size = evaluate('''
+struct $malloc_match {
+    void *addr;
+    uintptr_t size;
+    uintptr_t offset;
+    uintptr_t type;
+};
+sizeof(struct $malloc_match)
+''').unsigned
+        expr = get_iterate_memory_expr(options, process, user_init_code, user_return_code)
+        match_value = _get_match_value(options, expr, num_match, struct_size)
+        #save_to_file('/Users/gumichina01/Desktop/develop/projects/lldbutil/1.txt', '{}\n\n{}'.format(user_init_code, user_return_code))
+        (user_init_code, user_return_code) = _get_code(options, match_value)
+        #save_to_file('/Users/gumichina01/Desktop/develop/projects/lldbutil/2.txt', '{}\n\n{}'.format(user_init_code, user_return_code))
+        expr = get_iterate_memory_expr(options, process, user_init_code, user_return_code)
+        display_match_results(result, options, 'memory leaks', expr)
+        result.AppendMessage('{} seconds'.format(time.time() - start_time))
+
+def save_to_file(file_name, s):
+    f = open(file_name, 'w')
+    f.write(s)
+    f.close()
+
+class FreeGroup(ctypes.Structure):
+    _fields_ = [("addr", ctypes.c_uint),
+                ("size", ctypes.c_uint),
+                ("offset", ctypes.c_uint),
+                ("type", ctypes.c_uint)]
+
+def _get_match_value(options, expr, num, struct_size):
+    expr_sbvalue = evaluate(expr)
+    if options.verbose:
+        print "expression:"
+        print expr
+        print "expression result:"
+        print expr_sbvalue
+
+    error = lldb.SBError()
+    data = expr_sbvalue.GetPointeeData(0, num+1)
+    GroupArray = FreeGroup * (num + 1)
+    bytes = data.ReadRawData(error, 0, (num+1)*struct_size)
+    match_value = GroupArray()
+    ctypes.memmove(ctypes.addressof(match_value), bytes, len(bytes))
+
+    return match_value
+
+def _get_code(options, match_value):
+    create_map_code = '''
+'''
+
+    for value in match_value:
+        if False and value.addr:
+            create_map_code += '''
+    //insertToHash((void*){}, {}, {}, {});
+'''.format(value.addr, value.type, value.size, value.offset)
+
+    user_init_code = create_map_code + '''
+(int)printf("test1\\n");
+#define MAX_MATCHES %u
+typedef struct $malloc_match {
+    void *addr;
+    uintptr_t size;
+    uintptr_t offset;
+    uintptr_t type;
+} $malloc_match;
+typedef struct callback_baton_t {
+    range_callback_t callback;
+    unsigned num_matches;
+    $malloc_match matches[MAX_MATCHES];
+} callback_baton_t;
+range_callback_t range_callback = [](task_t task, void *baton, unsigned type, uintptr_t ptr_addr, uintptr_t ptr_size) -> void {
+    return;
+    callback_baton_t *info = (callback_baton_t *)baton;
+    typedef void* T;
+    const unsigned size = sizeof(T);
+    T *array = (T*)ptr_addr;
+    for (unsigned idx = 0; ((idx + 1) * sizeof(T)) <= ptr_size; ++idx) {
+        //removeFromHash(array[idx]);
+    }
+};
+callback_baton_t baton = { range_callback, 0, {0} };
+
+''' % (options.max_matches)
+    user_return_code = '''
+/*
+    enumeratehash_callback_t callback = [](void *baton, void* p, unsigned type, uintptr_t offset, uintptr_t size) -> void {
+        callback_baton_t *info = (callback_baton_t *)baton;
+        if (info->num_matches < MAX_MATCHES) {
+            info->matches[info->num_matches].addr = p;
+            info->matches[info->num_matches].type = type;
+            info->matches[info->num_matches].offset = offset;
+            info->matches[info->num_matches].size = size;
+            info->num_matches++;
+        }
+    };
+*/
+//(int)printf("test2\\n");
+    //enumerateHash(&baton, callback);
+
+    baton.matches[baton.num_matches].addr = 0; // Terminate the matches array
+    //clearHash();
+baton.matches'''
+
+    return user_init_code, user_return_code
 
 def get_class_refs_options ():
     usage = "usage: %prog [options] <EXPR> [EXPR ...]"
@@ -1518,11 +1702,13 @@ malloc_info.__doc__ = get_malloc_info_options().format_help()
 objc_refs.__doc__ = get_objc_refs_options().format_help()
 int_refs.__doc__ = get_int_refs_options().format_help()
 class_refs.__doc__ = get_class_refs_options().format_help()
+memory_leak.__doc__ = get_memory_leak_options().format_help()
 lldb.debugger.HandleCommand('command script add -f %s.ptr_refs ptr_refs' % __name__)
 lldb.debugger.HandleCommand('command script add -f %s.cstr_refs cstr_refs' % __name__)
 lldb.debugger.HandleCommand('command script add -f %s.malloc_info malloc_info' % __name__)
 lldb.debugger.HandleCommand('command script add -f %s.int_refs int_refs' % __name__)
 lldb.debugger.HandleCommand('command script add -f %s.class_refs class_refs' % __name__)
+lldb.debugger.HandleCommand('command script add -f %s.memory_leak memory_leak' % __name__)
 # lldb.debugger.HandleCommand('command script add -f %s.heap heap' % package_name)
 # lldb.debugger.HandleCommand('command script add -f %s.section_ptr_refs section_ptr_refs' % package_name)
 # lldb.debugger.HandleCommand('command script add -f %s.stack_ptr_refs stack_ptr_refs' % package_name)
