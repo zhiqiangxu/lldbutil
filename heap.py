@@ -896,71 +896,62 @@ def memory_leak(debugger, command, result, dict):
         result.AppendMessage('error: invalid frame')
         return
 
-    options.type = 'malloc_info'
+    options.type = 'pointer'
 
     if True:
-        user_init_code_format = '''
+        user_init_code0 = '''
 #define MAX_MATCHES %u
-struct $malloc_match {
+typedef struct $malloc_match {
     void *addr;
     uintptr_t size;
     uintptr_t offset;
     uintptr_t type;
-};
+} $malloc_match;
 typedef struct callback_baton_t {
     range_callback_t callback;
     unsigned num_matches;
     $malloc_match matches[MAX_MATCHES];
 } callback_baton_t;
 range_callback_t range_callback = [](task_t task, void *baton, unsigned type, uintptr_t ptr_addr, uintptr_t ptr_size) -> void {
-    callback_baton_t *info = (callback_baton_t *)baton;
-    info->matches[info->num_matches].addr = (void*)ptr_addr;
-    info->matches[info->num_matches].type = type;
-    info->matches[info->num_matches].size = ptr_size;
-    info->matches[info->num_matches].offset = 0;
-    ++info->num_matches;
-};
-callback_baton_t baton = { range_callback, 0, {0} };
-'''
-        user_return_code = '''
-        baton.matches[baton.num_matches].addr = 0;
-baton.matches'''
-
-        user_init_code0 = '''
-typedef struct callback_baton_t {
-    range_callback_t callback;
-    unsigned num_matches;
-} callback_baton_t;
-range_callback_t range_callback = [](task_t task, void *baton, unsigned type, uintptr_t ptr_addr, uintptr_t ptr_size) -> void {
-    callback_baton_t *info = (callback_baton_t *)baton;
-    ++info->num_matches;
+    insertToHash(1, (void*)ptr_addr, type, ptr_size, 0);
+    typedef void* T;
+    T *array = (T*)ptr_addr;
+    for (unsigned idx = 0; ((uintptr_t)array+(idx + 1) * sizeof(T)) <= ptr_addr+ptr_size; ++idx)
+        insertToHash(2, (void*)array[idx], type, ptr_size, 0);// 这里只有array[idx]有用
 };
 callback_baton_t baton = { range_callback, 0 };
 '''
         user_return_code0 = '''
-        baton.num_matches;
+    enumeratehash_callback_t callback = [](void *baton, void* p, unsigned type, uintptr_t offset, uintptr_t size) -> void {
+        callback_baton_t *info = (callback_baton_t *)baton;
+        if (info->num_matches < MAX_MATCHES) {
+            info->matches[info->num_matches].addr = p;
+            info->matches[info->num_matches].type = type;
+            info->matches[info->num_matches].offset = offset;
+            info->matches[info->num_matches].size = size;
+            info->num_matches++;
+        }
+    };
+//(int)printf("test2\\n");
+    enumerateHash(&baton, callback);
+
+    baton.matches[baton.num_matches].addr = 0; // Terminate the matches array
+    clearHash(1);
+    clearHash(2);
+    baton.matches;
 '''
         # Iterate through all of our pointer expressions and display the results
-        expr = get_iterate_memory_expr(options, process, user_init_code0, user_return_code0)
+        expr = get_iterate_memory_expr(options, process, user_init_code0 % options.max_matches, user_return_code0)
+        display_match_results(result, options, 'memory leaks', expr)
+        '''
         expr_value = evaluate(expr)
         num_match = expr_value.unsigned
-        user_init_code = user_init_code_format % (num_match + 1)
-        struct_size = evaluate('''
-struct $malloc_match {
-    void *addr;
-    uintptr_t size;
-    uintptr_t offset;
-    uintptr_t type;
-};
-sizeof(struct $malloc_match)
-''').unsigned
-        expr = get_iterate_memory_expr(options, process, user_init_code, user_return_code)
-        match_value = _get_match_value(options, expr, num_match, struct_size)
         #save_to_file('/Users/gumichina01/Desktop/develop/projects/lldbutil/1.txt', '{}\n\n{}'.format(user_init_code, user_return_code))
-        (user_init_code, user_return_code) = _get_code(options, match_value)
+        (user_init_code, user_return_code) = _get_code(options)
         #save_to_file('/Users/gumichina01/Desktop/develop/projects/lldbutil/2.txt', '{}\n\n{}'.format(user_init_code, user_return_code))
         expr = get_iterate_memory_expr(options, process, user_init_code, user_return_code)
         display_match_results(result, options, 'memory leaks', expr)
+        '''
         result.AppendMessage('{} seconds'.format(time.time() - start_time))
 
 def save_to_file(file_name, s):
@@ -991,17 +982,8 @@ def _get_match_value(options, expr, num, struct_size):
 
     return match_value
 
-def _get_code(options, match_value):
-    create_map_code = '''
-'''
-
-    for value in match_value:
-        if False and value.addr:
-            create_map_code += '''
-    //insertToHash((void*){}, {}, {}, {});
-'''.format(value.addr, value.type, value.size, value.offset)
-
-    user_init_code = create_map_code + '''
+def _get_code(options):
+    user_init_code = '''
 (int)printf("test1\\n");
 #define MAX_MATCHES %u
 typedef struct $malloc_match {
@@ -1016,20 +998,25 @@ typedef struct callback_baton_t {
     $malloc_match matches[MAX_MATCHES];
 } callback_baton_t;
 range_callback_t range_callback = [](task_t task, void *baton, unsigned type, uintptr_t ptr_addr, uintptr_t ptr_size) -> void {
-    return;
     callback_baton_t *info = (callback_baton_t *)baton;
     typedef void* T;
     const unsigned size = sizeof(T);
     T *array = (T*)ptr_addr;
-    for (unsigned idx = 0; ((idx + 1) * sizeof(T)) <= ptr_size; ++idx) {
-        //removeFromHash(array[idx]);
+    for (unsigned idx = 0; ((uintptr_t)array+(idx + 1) * sizeof(T)) <= ptr_addr+ptr_size; ++idx) {
+        removeFromHash(array[idx]);
+        /*
+        if (array[idx] == 0x7a777ad0) {
+            auto f = (FILE *)fopen("/Users/gumichina01/Desktop/develop/projects/lldbutil/debug.log", "w");
+            (int)fprintf(f, "remove:%%p idx:%%d\\n", ptr_addr, idx);
+            (int)fclose(f);
+        }
+        */
     }
 };
 callback_baton_t baton = { range_callback, 0, {0} };
 
 ''' % (options.max_matches)
     user_return_code = '''
-/*
     enumeratehash_callback_t callback = [](void *baton, void* p, unsigned type, uintptr_t offset, uintptr_t size) -> void {
         callback_baton_t *info = (callback_baton_t *)baton;
         if (info->num_matches < MAX_MATCHES) {
@@ -1040,12 +1027,11 @@ callback_baton_t baton = { range_callback, 0, {0} };
             info->num_matches++;
         }
     };
-*/
 //(int)printf("test2\\n");
-    //enumerateHash(&baton, callback);
+    enumerateHash(&baton, callback);
 
     baton.matches[baton.num_matches].addr = 0; // Terminate the matches array
-    //clearHash();
+    clearHash();
 baton.matches'''
 
     return user_init_code, user_return_code
